@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>เขียนกลางอากาศ → ขึ้นรูป</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,"Noto Sans Thai",sans-serif;background:#0f1220;color:#eee;display:flex;gap:16px;padding:16px;flex-wrap:wrap;justify-content:center}
+  .box{background:#1a1f36;border-radius:14px;padding:12px}
+  #stage{position:relative;width:640px;max-width:100%}
+  canvas#view{width:100%;border-radius:10px;background:#000;display:block}
+  #status{margin:8px 0;font-size:14px;color:#9fd}
+  #side{width:320px;max-width:100%}
+  #result{min-height:260px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
+  #word{font-size:32px;font-weight:700;margin-bottom:8px;word-break:break-all}
+  #pic{max-width:100%;max-height:220px;border-radius:10px}
+  #emoji{font-size:110px;line-height:1}
+  button,select{background:#3b4cca;color:#fff;border:0;border-radius:8px;padding:8px 12px;font-size:14px;cursor:pointer;margin:2px}
+  ul{padding-left:18px;font-size:13px;line-height:1.6;margin:6px 0}
+  small{color:#99a}
+</style>
+</head>
+<body>
+<div class="box" id="stage">
+  <canvas id="view" width="640" height="480"></canvas>
+  <div id="status">กำลังโหลด…</div>
+  <button id="btnRec">🔍 อ่านคำ</button>
+  <button id="btnClr">🧹 ล้าง</button>
+  <select id="lang">
+    <option value="eng">English</option>
+    <option value="tha">ไทย</option>
+  </select>
+</div>
+
+<div class="box" id="side">
+  <div id="result">
+    <div id="word">—</div>
+    <div id="emoji"></div>
+    <img id="pic" alt="" hidden>
+  </div>
+  <ul>
+    <li>☝️ ชูนิ้วชี้นิ้วเดียว = เขียน</li>
+    <li>✌️ ชูสองนิ้วค้างไว้ = อ่านคำ + แสดงรูป</li>
+    <li>🖐️ แบมมือค้างไว้ = ล้างกระดาน</li>
+  </ul>
+  <small>เขียนตัวพิมพ์ใหญ่ใหญ่ ๆ ทีละคำ เช่น CAT, DOG, SUN, หมา, แมว</small>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script>
+const W = 640, H = 480;
+const view = document.getElementById('view'), vctx = view.getContext('2d');
+const ink = document.createElement('canvas'); ink.width = W; ink.height = H;
+const ictx = ink.getContext('2d');
+const $ = id => document.getElementById(id);
+const status = t => $('status').textContent = t;
+
+// ---- ภาพ/อีโมจิของคำ (เพิ่มได้เอง) ----
+const EMOJI = {
+  cat:'🐱', dog:'🐶', sun:'☀️', moon:'🌙', star:'⭐', tree:'🌳', fish:'🐟', bird:'🐦',
+  car:'🚗', bus:'🚌', book:'📚', house:'🏠', home:'🏠', heart:'❤️', fire:'🔥', water:'💧',
+  apple:'🍎', cake:'🍰', ice:'🧊', flower:'🌸', rain:'🌧️', egg:'🥚',
+  หมา:'🐶', สุนัข:'🐶', แมว:'🐱', ปลา:'🐟', นก:'🐦', ดวงอาทิตย์:'☀️', พระจันทร์:'🌙',
+  ดาว:'⭐', ต้นไม้:'🌳', รถ:'🚗', บ้าน:'🏠', หัวใจ:'❤️', ไฟ:'🔥', น้ำ:'💧', ไอติม:'🍦', ไอศกรีม:'🍦'
+};
+
+function clearInk(){
+  ictx.fillStyle = '#fff'; ictx.fillRect(0,0,W,H);
+}
+clearInk();
+
+// ---- วาด ----
+let last = null, sm = null;
+function drawTo(p){
+  sm = sm ? {x: sm.x*0.6 + p.x*0.4, y: sm.y*0.6 + p.y*0.4} : p;
+  if (last){
+    ictx.strokeStyle = '#000'; ictx.lineWidth = 9; ictx.lineCap = 'round'; ictx.lineJoin = 'round';
+    ictx.beginPath(); ictx.moveTo(last.x, last.y); ictx.lineTo(sm.x, sm.y); ictx.stroke();
+  }
+  last = {...sm};
+}
+function penUp(){ last = null; sm = null; }
+
+// ---- ท่ามือ ----
+const up = (l,t,p) => l[t].y < l[p].y;
+function gesture(l){
+  const i = up(l,8,6), m = up(l,12,10), r = up(l,16,14), p = up(l,20,18);
+  if (i && !m && !r && !p) return 'draw';
+  if (i && m && !r && !p) return 'recognize';
+  if (i && m && r && p) return 'clear';
+  return 'none';
+}
+let hold = {g:'none', n:0}, cooldown = 0;
+
+// ---- อ่านคำ ----
+let busy = false;
+async function recognize(){
+  if (busy) return; busy = true;
+  status('กำลังอ่านคำ…');
+  try{
+    const lang = $('lang').value;
+    const worker = await Tesseract.createWorker(lang);
+    await worker.setParameters({ tessedit_pageseg_mode: '7' });
+    const { data } = await worker.recognize(ink);
+    await worker.terminate();
+    const word = data.text.replace(/[^A-Za-z\u0E00-\u0E7F]/g,'').trim();
+    await showWord(word, lang);
+  }catch(e){ status('อ่านไม่สำเร็จ: ' + e.message); }
+  busy = false;
+}
+
+async function showWord(word, lang){
+  $('word').textContent = word || '(อ่านไม่ออก)';
+  $('emoji').textContent = ''; $('pic').hidden = true;
+  if (!word){ status('ลองเขียนให้ใหญ่และชัดขึ้น'); return; }
+  const key = word.toLowerCase();
+  if (EMOJI[key]){ $('emoji').textContent = EMOJI[key]; status('พบรูปของ "'+word+'"'); return; }
+  // ไม่มีในพจนานุกรม → ดึงรูปจาก Wikipedia
+  try{
+    const host = lang === 'tha' ? 'th' : 'en';
+    const r = await fetch(`https://${host}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(word)}`);
+    const j = await r.json();
+    if (j.thumbnail){ $('pic').src = j.thumbnail.source; $('pic').hidden = false; status('รูปจาก Wikipedia'); return; }
+  }catch(e){}
+  $('emoji').textContent = '❓'; status('ไม่พบรูปของ "'+word+'"');
+}
+
+// ---- MediaPipe ----
+const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}` });
+hands.setOptions({ maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.7, minTrackingConfidence:0.6 });
+hands.onResults(res => {
+  vctx.save();
+  vctx.translate(W,0); vctx.scale(-1,1);          // กลับซ้าย-ขวาให้เหมือนกระจก
+  vctx.drawImage(res.image, 0, 0, W, H);
+  vctx.restore();
+  vctx.globalAlpha = 0.55; vctx.drawImage(ink, 0, 0); vctx.globalAlpha = 1;
+
+  const l = res.multiHandLandmarks && res.multiHandLandmarks[0];
+  if (!l){ penUp(); hold = {g:'none', n:0}; return; }
+  const tip = { x: (1 - l[8].x) * W, y: l[8].y * H };
+  const g = gesture(l);
+
+  vctx.fillStyle = g === 'draw' ? '#0f0' : '#f80';
+  vctx.beginPath(); vctx.arc(tip.x, tip.y, 8, 0, 7); vctx.fill();
+
+  if (g === 'draw') drawTo(tip); else penUp();
+
+  if (g === hold.g) hold.n++; else hold = {g, n:1};
+  if (cooldown > 0) cooldown--;
+  if (cooldown === 0){
+    if (g === 'recognize' && hold.n > 20){ cooldown = 60; recognize(); }
+    if (g === 'clear' && hold.n > 25){ cooldown = 40; clearInk(); }
+  }
+});
+
+$('btnRec').onclick = recognize;
+$('btnClr').onclick = () => { clearInk(); $('word').textContent='—'; $('emoji').textContent=''; $('pic').hidden=true; };
+
+const cam = new Camera(document.createElement('video'), {
+  onFrame: async () => { await hands.send({ image: cam.video }); },
+  width: W, height: H
+});
+cam.start().then(() => status('พร้อมแล้ว — ชูนิ้วชี้เพื่อเขียน'))
+  .catch(e => status('เปิดกล้องไม่ได้: ' + e.message));
+</script>
+</body>
+</html>
